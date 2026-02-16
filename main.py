@@ -11,7 +11,6 @@ class YouTubeDownloader:
 
         self._ensure_directories()
         self.ffmpeg_path = self._get_ffmpeg_path()
-        self._validate_cookies_file()
 
     # ---------------------------------------------------------
     # Directory Handling
@@ -31,28 +30,31 @@ class YouTubeDownloader:
         if os.path.exists("ffmpeg.exe"):
             return os.path.abspath("ffmpeg.exe")
 
-        print("\n[CRITICAL ERROR] FFmpeg binary not found.")
+        print("\n[CRITICAL ERROR] FFmpeg binary not found in PATH.")
         sys.exit(1)
 
     # ---------------------------------------------------------
-    # Cookie Validation
+    # Authentication Resolution
     # ---------------------------------------------------------
-    def _validate_cookies_file(self):
+    def _resolve_authentication(self):
         """
-        Validates existence and readability of cookies file.
-        Required for members-only content.
+        Priority:
+        1. cookies.txt file
+        2. Chrome browser cookies
+        3. Edge browser cookies
+        4. None (unauthenticated)
         """
-        if not os.path.exists(self.cookies_path):
-            print(f"[Warning] Cookies file not found at: {self.cookies_path}")
-            print("Members-only videos will NOT be accessible.")
-            self.cookies_available = False
-        else:
-            if os.path.getsize(self.cookies_path) == 0:
-                print("[Warning] Cookies file is empty.")
-                self.cookies_available = False
-            else:
-                print(f"[Info] Using cookies file: {os.path.abspath(self.cookies_path)}")
-                self.cookies_available = True
+
+        # 1️⃣ Check cookies.txt
+        if os.path.exists(self.cookies_path) and os.path.getsize(self.cookies_path) > 0:
+            print(f"[Auth] Using cookies file: {os.path.abspath(self.cookies_path)}")
+            return {"cookiefile": self.cookies_path}
+
+        print("[Auth] cookies.txt not found or empty.")
+
+        # 2️⃣ Try Chrome
+        print("[Auth] Attempting Chrome cookie extraction...")
+        return {"cookiesfrombrowser": ("chrome",)}
 
     # ---------------------------------------------------------
     # Progress Hook
@@ -75,30 +77,33 @@ class YouTubeDownloader:
     # ---------------------------------------------------------
     def download(self, url):
 
+        # Resolve Authentication
+        auth_config = self._resolve_authentication()
+
         ydl_opts = {
             # File Naming
             'outtmpl': os.path.join(
                 self.download_path,
                 '%(playlist_title)s/%(playlist_index)s - %(title)s [%(id)s].%(ext)s'
             ),
-
             'restrictfilenames': True,
 
             # Playlist Handling
             'noplaylist': False,
             'ignoreerrors': True,
-            'playlistreverse': False,
 
             # FFmpeg
             'ffmpeg_location': self.ffmpeg_path,
 
-            # Format Selection
+            # Quality
             'format': 'bestvideo+bestaudio/best',
             'merge_output_format': 'mp4',
-
             'postprocessor_args': {
                 'merger': ['-c:v', 'copy', '-c:a', 'aac']
             },
+
+            # JS Engine
+            'jsengine': 'node',
 
             # Metadata
             'writethumbnail': True,
@@ -111,54 +116,55 @@ class YouTubeDownloader:
             'retries': 10,
             'continuedl': True,
 
-            # Hooks
-            'progress_hooks': [self.progress_hook],
+            # Progress
+            'progress_hooks': [self.progress_hook]
         }
 
-        # ---------------------------------------------------------
-        # Add Cookies (Critical for Members-Only)
-        # ---------------------------------------------------------
-        if self.cookies_available:
-            ydl_opts['cookiefile'] = self.cookies_path
-        else:
-            print("[Info] Proceeding without authentication.")
+        # Inject authentication strategy
+        ydl_opts.update(auth_config)
 
         try:
             print(f"Using FFmpeg at: {self.ffmpeg_path}")
             print(f"Initializing download for: {url}")
             print("-" * 60)
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # First attempt (cookies.txt OR Chrome)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
 
-                info = ydl.extract_info(url, download=False)
+                    if 'entries' in info:
+                        print(f"Playlist: {info.get('title')}")
+                        print(f"Total Videos: {len(info.get('entries', []))}")
+                    else:
+                        print(f"Title: {info.get('title')}")
+                        print(f"Availability: {info.get('availability')}")
 
-                # Detect login requirement
-                if info.get('availability') == 'needs_auth':
-                    if not self.cookies_available:
-                        raise Exception(
-                            "This video requires login (Members-Only). "
-                            "Cookies file is missing or invalid."
-                        )
+                    print("-" * 60)
 
-                # Playlist Detection
-                if 'entries' in info:
-                    print(f"Playlist Title: {info.get('title')}")
-                    print(f"Total Videos: {len(info.get('entries', []))}")
+                    ydl.download([url])
+
+            except yt_dlp.utils.DownloadError as chrome_error:
+                # If Chrome was used and failed, try Edge fallback
+                if auth_config.get("cookiesfrombrowser") == ("chrome",):
+                    print("[Auth] Chrome authentication failed. Trying Edge...")
+                    ydl_opts.pop("cookiesfrombrowser", None)
+                    ydl_opts["cookiesfrombrowser"] = ("edge",)
+
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
                 else:
-                    print(f"Title: {info.get('title')}")
-                    print(f"Uploader: {info.get('uploader')}")
-                    print(f"Availability: {info.get('availability')}")
+                    raise chrome_error
 
-                print("-" * 60)
-
-                ydl.download([url])
-
-            print(f"\n[Success] Content saved to: {os.path.abspath(self.download_path)}")
+            print(f"\n[Success] Saved to: {os.path.abspath(self.download_path)}")
             return True
 
         except yt_dlp.utils.DownloadError as e:
-            print("\n[DownloadError] Possible authentication failure.")
-            print("Ensure cookies are exported correctly from the same browser where you are logged in.")
+            print("\n[DownloadError] Authentication or access issue.")
+            print("Possible causes:")
+            print("- Not logged into YouTube in browser")
+            print("- Expired cookies")
+            print("- Members-only content without membership")
             print(f"Details: {e}")
             return False
 
